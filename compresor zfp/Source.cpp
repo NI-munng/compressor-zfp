@@ -11,6 +11,8 @@
 * or implied  warranties,  other  than those  that are  expressly stated  in the
 * License.
 *******************************************************************************/
+#define ChangeToImage 1
+#define _CRT_SECURE_NO_WARNINGS
 
 #include <stdio.h>
 #include <math.h>
@@ -18,16 +20,31 @@
 #include <stdlib.h>
 #include <omp.h>
 #include <assert.h>
+#include <iostream>
+
 
 #include <ippdc.h>
 #include <ipps.h>
+
+#if ChangeToImage
+#include <opencv2/core.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/highgui.hpp>
+#include <opencv2/core/matx.hpp>
+#include <opencv2/objdetect/objdetect.hpp>
+#endif
 
 #define MIN(a, b) (a < b? a : b)
 #define MAX(a, b) (a > b? a : b)
 /* Max dimension size is limited for this example, since dealing with huge arrays requires "long" IPP functions usage */
 #define MAX_DIM 640
 
+#if !ChangeToImage
 void InitSrcArray(Ipp32f*, int, int, int);
+#else
+void InitSrcArray(Ipp32f*, cv::Mat, int, int, int);
+void DecodeArray(Ipp32f* pSrc, cv::Mat* pimage, int dimX, int dimY, int dimZ);
+#endif
 void Compress(int threads, const Ipp32f* pSrc, int maxX, int maxY, int maxZ, Ipp64f accur, double ratio, Ipp8u* pChunkBuffer, Ipp8u* pDst, int* pComprLen);
 void Decompress(int threads, const Ipp8u* pSrc, int srcLen, int maxX, int maxY, int maxZ, Ipp64f accur, double ratio, Ipp32f* pDst);
 static double GetWallTime();
@@ -47,12 +64,58 @@ int main(int argc, const char* argv[])
     Ipp32f* pSrcArray, * pDstArray;
     Ipp8u* pBuffer, * pMergeBuffer;
     double accuracy = 0, ratio = 10.0;
+    int Starting_thread = 1;
     int nx, ny, nz, numFloats = 0, maxThreads = omp_get_max_threads(), threads;
     double waitTime = 1.;
     long iter;
     int i;
 
-    nx = ny = nz = 100; /* Default dimension */
+    //Starting_thread = maxThreads;
+#if ChangeToImage
+    std::string image_path = "../Image/pngwing.com.png";
+    cv::Mat img;
+
+    for (i = 1; i < argc; i++) {
+        if (strncmp(argv[i], "-i", 2) == 0) {
+            /* Input image path*/
+            image_path = argv[++i];
+            continue;
+        }
+        if (strncmp(argv[i], "-mt", 3) == 0) {
+            maxThreads = atoi(argv[++i]);
+            assert(maxThreads > 0 && maxThreads <= omp_get_max_threads());
+            continue;
+        }
+        if (strncmp(argv[i], "-r", 2) == 0) {
+            ratio = atof(argv[++i]);
+            /* In fixed rate mode max ratio is 32, i.e. 32 FP -> 1 bit compressed */
+            assert(ratio > 0 && ratio <= 32);
+            continue;
+        }
+    }
+
+    img = cv::imread(image_path, cv::IMREAD_UNCHANGED);
+    if (img.empty())
+    {
+        std::cout << "Could not read the image: " << image_path << std::endl;
+        return 1;
+    }
+
+    nx = img.cols; //1920
+    ny = img.rows;
+    nz = img.channels(); // number of channel
+
+    /* Check if dimensions are multiple of four */
+    assert(nx % 4 == 0 && ny % 4 == 0 && nz % 4 == 0);
+    /* Limit size of source data array. Larger sizes require different coding */
+    assert(nx * ny * nz <= pow(MAX_DIM,3));
+
+    std::cout << "we has image with x: " << nx << " y: " << ny << " z: " << nz  << std::endl;
+ 
+#endif
+
+#if !ChangeToImage
+    nx = ny = nz = 300; /* Default dimension */
     for (i = 1; i < argc; i++) {
         if (strncmp(argv[i], "-d", 2) == 0) {
             nx = atoi(argv[++i]);
@@ -86,10 +149,19 @@ int main(int argc, const char* argv[])
             continue;
         }
     }
+#endif
+    //Ipp32f* ippiMalloc_32f_C3(hei, wei, step?);
     numFloats = nx * ny * nz;
     pSrcArray = ippsMalloc_32f(numFloats);
     pDstArray = ippsMalloc_32f(numFloats);
+#if !ChangeToImage
     InitSrcArray(pSrcArray, nx, ny, nz);
+#else
+    InitSrcArray(pSrcArray, img, nx, ny, nz);
+#endif
+
+
+
     int bufLen = MAX_BYTES_PER_BLOCK * ((numFloats + 63) / 64);
     pBuffer = ippsMalloc_8u(bufLen);
     pMergeBuffer = ippsMalloc_8u(bufLen);
@@ -98,7 +170,7 @@ int main(int argc, const char* argv[])
     else
         printf("Threads Bits/block Ratio   Compr.time.(msec)   Decompr.time(msec)    Max.err\n");
     printf("----------------------------------------------------------------------------\n");
-    for (threads = 1; threads <= maxThreads; threads++) {
+    for (threads = Starting_thread ; threads <= maxThreads; threads++) {
         printf("%4d", threads);
         int comprLen, i;
         double maxErr;
@@ -117,6 +189,10 @@ int main(int argc, const char* argv[])
         else
             printf("%11d%9.1f%11.1f", GetBitWidth(ratio), resRatio, execTime);
         iter = 0;
+        /* store in binary file */
+        FILE* f = fopen("client.data", "wb");
+        fwrite(pMergeBuffer, sizeof(Ipp8u), comprLen, f);
+        fclose(f);
         timeStart = GetWallTime();
         do {
             Decompress(threads, pMergeBuffer, comprLen, nx, ny, nz, accuracy, ratio, pDstArray);
@@ -134,11 +210,22 @@ int main(int argc, const char* argv[])
         }
         printf("%20.1f%21.4g\n", execTime, maxErr);
     }
+#if ChangeToImage
+    cv::Mat fin_img;
+    DecodeArray(pDstArray, &fin_img, nx, ny, nz);
+    cv::namedWindow("after compress", cv::WINDOW_NORMAL);
+
+    imshow("after compress", fin_img);
+    cv::imwrite("../Image/saveimage.png", fin_img);
+    cv::waitKey(0);
+#endif
     ippsFree(pBuffer);
     ippsFree(pSrcArray);
     ippsFree(pDstArray);
     ippsFree(pMergeBuffer);
 }
+
+#if !ChangeToImage
 /* Data initialization from ZFP's "simple" example */
 void InitSrcArray(Ipp32f* pSrc, int dimX, int dimY, int dimZ)
 {
@@ -153,7 +240,80 @@ void InitSrcArray(Ipp32f* pSrc, int dimX, int dimY, int dimZ)
                 pSrc[i + dimX * (j + dimY * k)] = (Ipp32f)exp(-(x * x + y * y + z * z));
             }
 }
+#else
+void InitSrcArray(Ipp32f* pSrc, cv::Mat pimage, int dimX, int dimY, int dimZ)
+{
+    int k = 0;
+    int i = 0;
+    int j = 0;
 
+    cv::Mat Channels[4];
+    cv::split(pimage, Channels);
+    cv::namedWindow("before compress", cv::WINDOW_NORMAL);
+
+    imshow("before compress", pimage);
+    cv::waitKey(10);
+    /*cv::namedWindow("Blue", cv::WINDOW_NORMAL);
+
+    imshow("Red", Channels[0]);
+
+
+
+    cv::namedWindow("Green", cv::WINDOW_NORMAL);
+
+    imshow("Green", Channels[1]);
+
+
+
+    cv::namedWindow("Red", cv::WINDOW_NORMAL);
+
+    imshow("Blue", Channels[2]);
+    cv::namedWindow("Alpha", cv::WINDOW_NORMAL);
+
+    imshow("Alpha", Channels[3]);
+
+
+    cv::waitKey(0);*/
+
+    for (k = 0; k < dimZ; k++)
+        for (j = 0; j < dimY; j++)
+            for (i = 0; i < dimX; i++) {
+
+                pSrc[i + dimX * (j + dimY * k)] = (Ipp32f)Channels[k].at<ushort>(j, i);
+            }
+}
+
+void DecodeArray(Ipp32f* pSrc, cv::Mat* pimage, int dimX, int dimY, int dimZ)
+{
+    int k = 0;
+    int i = 0;
+    int j = 0;
+    //cv::Vec4b intensity;
+    std::vector<cv::Mat> Channels;
+    Channels.push_back(cv::Mat::zeros(1100, 1100, CV_16UC1));
+    Channels.push_back(cv::Mat::zeros(1100, 1100, CV_16UC1));
+    Channels.push_back(cv::Mat::zeros(1100, 1100, CV_16UC1));
+    Channels.push_back(cv::Mat::zeros(1100, 1100, CV_16UC1));
+ 
+    for (k = 0; k < dimZ; k++)
+        for (j = 0; j < dimY; j++)
+            for (i = 0; i < dimX; i++) {
+                Channels[k].at<ushort>(j, i) = pSrc[i + dimX * (j + dimY * k)];
+            }
+    cv::namedWindow("after Blue", cv::WINDOW_NORMAL);
+    imshow("after Blue", Channels[0]);
+    cv::namedWindow("after Green", cv::WINDOW_NORMAL);
+    imshow("after Green", Channels[1]);
+    cv::namedWindow("after Red", cv::WINDOW_NORMAL);
+    imshow("after Red", Channels[2]);
+    cv::namedWindow("after Alpha", cv::WINDOW_NORMAL);
+    imshow("after Alpha", Channels[3]);
+    cv::waitKey(10);
+
+    cv::merge(Channels, *pimage);
+}
+
+#endif
 void Compress(int threads, const Ipp32f* pSrc, int maxX, int maxY, int maxZ, Ipp64f accuracy, double ratio, Ipp8u* pChunkBuffer, Ipp8u* pDst, int* pComprLen)
 {
     int encStateSize;
